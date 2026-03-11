@@ -1223,6 +1223,15 @@ def register_account(
             log.info(f"  [4] 跳过发送 OTP（服务器已自动发送）")
         else:
             # --- 4. 请求发送 OTP 验证码（新账号需要手动触发）---
+            try:
+                delete_mail(
+                    mail_account,
+                    freemail_worker_domain=freemail_worker_domain,
+                    freemail_token=freemail_token,
+                )
+            except Exception as e:
+                log.warning(f"  💾 删除历史邮件失败，继续发送 OTP: {e}")
+
             otp_sent_at = time.time()
             log.info(f"  [4] 发送 OTP...")
             otp_resp = http.post_json(
@@ -1367,6 +1376,35 @@ def register_account(
         log.info(f"  🎉 {mode_label}成功！")
         return result
 
+def delete_mail(
+    account: MailAccount,
+    freemail_worker_domain: str = "",
+    freemail_token: str = ""
+):
+    if not account.is_freemail:
+        log.info("非freemail账号，跳过删除")
+        return
+    worker_domain = (freemail_worker_domain or "").strip()
+    token = (freemail_token or "").strip()
+    if not worker_domain or not token:
+        log.warning("配置缺失")
+        return
+    BASE_URL = worker_domain if worker_domain.startswith(("http://", "https://")) else f"https://{worker_domain}"
+    HEADERS = {"Authorization": f"Bearer {token}"}
+    resp = requests.delete(
+                    f"{BASE_URL}/api/emails",
+                    params={"mailbox": account.email},
+                    headers=HEADERS,
+                    timeout=10
+                )
+    if resp.status_code == 200:
+        result=resp.json()
+        if result['success']:
+            log.info(f"  💾 已删除邮箱{account.email}中的{result['deletedCount']}封邮件")
+        else:
+            log.warning("  💾 删除失败")
+    else:
+        log.warning(f"  💾 删除请求失败: {resp.status_code}")
 
 # ═══════════════════════════════════════════════════════
 # 单账号注册（带重试）
