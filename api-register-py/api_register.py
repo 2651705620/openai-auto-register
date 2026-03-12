@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import random
+import requests
 import re
 import secrets
 import sys
@@ -34,14 +35,12 @@ from urllib.error import HTTPError, URLError
 import email as email_module
 import html as html_module
 import argparse
-
 from curl_cffi import requests as cffi_requests
 
 # ═══════════════════════════════════════════════════════
 # 常量配置
 # ═══════════════════════════════════════════════════════
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
 # OpenAI OAuth
 OAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 OAI_AUTH_URL = "https://auth.openai.com/oauth/authorize"
@@ -96,6 +95,7 @@ class MailAccount:
     password: str
     client_id: str = ""
     refresh_token: str = ""
+    is_freemail: bool = False
 
     @classmethod
     def parse(cls, line: str) -> "MailAccount":
@@ -764,6 +764,9 @@ def poll_verification_code(
     otp_sent_at: Optional[float] = None,
     cancel_fn: Optional[Callable] = None,
     domain_mail: Optional[dict] = None,
+    is_freemail: bool = False,
+    freemail_worker_domain: str = "",
+    freemail_token: str = "",
 ) -> str:
     """轮询邮箱获取 OpenAI 6 位验证码
     
@@ -772,8 +775,62 @@ def poll_verification_code(
     """
     is_domain = domain_mail is not None
     mode_label = "域名邮箱" if is_domain else "Outlook"
+    if is_freemail:
+        mode_label = "FreeMail"
     log.info(f"    📧 等待验证码 ({account.email}, {mode_label})...")
     used = used_codes or set()
+    #Freemail
+    if is_freemail:
+        worker_domain = (freemail_worker_domain or "").strip()
+        token = (freemail_token or "").strip()
+        if not worker_domain or not token:
+            raise ValueError("❌ 缺少 FreeMail 配置: worker_domain 或 token")
+        BASE_URL = worker_domain if worker_domain.startswith(("http://", "https://")) else f"https://{worker_domain}"
+        HEADERS = {"Authorization": f"Bearer {token}"}
+        log.info(f"    📡 使用 FreeMail 服务获取验证码...")
+        start_time = time.time()
+        last_resend = 0.0
+        interval = 2
+        while time.time() - start_time < timeout:
+            if cancel_fn and cancel_fn():
+                raise InterruptedError("用户取消")
+            try:
+                resp = requests.get(
+                    f"{BASE_URL}/api/emails",
+                    params={"mailbox": account.email},
+                    headers=HEADERS,
+                    timeout=10
+                )
+                if resp.status_code == 200:
+                    emails=resp.json()
+                    if emails and len(emails)>0:
+                        first_email=emails[0]
+                        log.info(f"    📡 FreeMail 收到邮件: {first_email.get('subject','')}")
+                        subject=first_email.get("subject","")
+                        match = re.search(r'([0-9]{6})$', subject)
+                        if match:
+                            code=match.group(1)
+                            if code not in used:
+                                used.add(code)
+                                elapsed = int(time.time() - start_time)
+                                log.info(f"    ✅ 验证码: {code} (耗时 {elapsed}s, FreeMail 服务)")
+                                return code
+                else:
+                    log.warning(f"    ⚠ FreeMail 服务响应异常: {resp.status_code} {resp.text}")
+            except Exception as e:
+                log.warning(f"    ⚠ FreeMail 服务查询失败: {e}")
+
+            elapsed_now = time.time() - start_time
+            if resend_fn and elapsed_now > 20 and (elapsed_now - last_resend) > OTP_RESEND_INTERVAL:
+                try:
+                    resend_fn()
+                    last_resend = elapsed_now
+                except Exception:
+                    pass
+
+            time.sleep(interval)
+
+        raise TimeoutError(f"验证码超时 ({timeout}s)")
 
     # ★ 域名邮箱快速路径
     if is_domain:
@@ -1068,6 +1125,8 @@ def register_account(
     mode: str = "register",
     cancel_fn: Optional[Callable] = None,
     domain_mail: Optional[dict] = None,
+    freemail_worker_domain: str = "",
+    freemail_token: str = "",
 ) -> dict:
     """
     通过 API 注册或登录 OpenAI 账号。
@@ -1164,6 +1223,15 @@ def register_account(
             log.info(f"  [4] 跳过发送 OTP（服务器已自动发送）")
         else:
             # --- 4. 请求发送 OTP 验证码（新账号需要手动触发）---
+            try:
+                delete_mail(
+                    mail_account,
+                    freemail_worker_domain=freemail_worker_domain,
+                    freemail_token=freemail_token,
+                )
+            except Exception as e:
+                log.warning(f"  💾 删除历史邮件失败，继续发送 OTP: {e}")
+
             otp_sent_at = time.time()
             log.info(f"  [4] 发送 OTP...")
             otp_resp = http.post_json(
@@ -1186,6 +1254,9 @@ def register_account(
             otp_sent_at=otp_sent_at,
             cancel_fn=cancel_fn,
             domain_mail=domain_mail,
+            is_freemail=mail_account.is_freemail,
+            freemail_worker_domain=freemail_worker_domain,
+            freemail_token=freemail_token,
         )
 
         _check_cancel()
@@ -1305,6 +1376,35 @@ def register_account(
         log.info(f"  🎉 {mode_label}成功！")
         return result
 
+def delete_mail(
+    account: MailAccount,
+    freemail_worker_domain: str = "",
+    freemail_token: str = ""
+):
+    if not account.is_freemail:
+        log.info("非freemail账号，跳过删除")
+        return
+    worker_domain = (freemail_worker_domain or "").strip()
+    token = (freemail_token or "").strip()
+    if not worker_domain or not token:
+        log.warning("配置缺失")
+        return
+    BASE_URL = worker_domain if worker_domain.startswith(("http://", "https://")) else f"https://{worker_domain}"
+    HEADERS = {"Authorization": f"Bearer {token}"}
+    resp = requests.delete(
+                    f"{BASE_URL}/api/emails",
+                    params={"mailbox": account.email},
+                    headers=HEADERS,
+                    timeout=10
+                )
+    if resp.status_code == 200:
+        result=resp.json()
+        if result['success']:
+            log.info(f"  💾 已删除邮箱{account.email}中的{result['deletedCount']}封邮件")
+        else:
+            log.warning("  💾 删除失败")
+    else:
+        log.warning(f"  💾 删除请求失败: {resp.status_code}")
 
 # ═══════════════════════════════════════════════════════
 # 单账号注册（带重试）

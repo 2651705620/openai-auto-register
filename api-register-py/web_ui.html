@@ -616,6 +616,10 @@
             style="flex:1; padding:8px 12px; font-size:0.85rem;">
             📮 Outlook 账号模式
           </button>
+          <button class="btn btn-outline" id="btnModeFreemail" onclick="setMailMode('freemail')"
+            style="flex:1; padding:8px 12px; font-size:0.85rem;">
+            📨 FreeMail 模式
+          </button>
           <button class="btn btn-outline" id="btnModeDomain" onclick="setMailMode('domain')"
             style="flex:1; padding:8px 12px; font-size:0.85rem;">
             🌐 域名邮箱模式
@@ -629,6 +633,26 @@
             <textarea id="accounts"
               placeholder="每行一个，格式: 邮箱----密码----client_id----refresh_token&#10;例如:&#10;user@outlook.com----password123----client_id----refresh_token"></textarea>
             <div class="hint">支持从 accounts.txt 粘贴，每行一个账号</div>
+          </div>
+        </div>
+
+        <!-- FreeMail 模式 -->
+        <div id="panelFreemail" style="display:none;">
+          <div class="form-group">
+            <label>邮箱地址列表</label>
+            <textarea id="freemailEmails"
+              placeholder="每行一个邮箱地址（不需要密码）&#10;例如:&#10;user1@example.com&#10;user2@example.com"></textarea>
+            <div class="hint">仅填写邮箱地址，验证码由 FreeMail 服务拉取</div>
+          </div>
+          <div class="grid-2">
+            <div class="form-group">
+              <label>Worker 网址</label>
+              <input type="text" id="freemailWorkerDomain" placeholder="https://your-worker.example.workers.dev">
+            </div>
+            <div class="form-group">
+              <label>FreeMail Token</label>
+              <input type="text" id="freemailToken" placeholder="freemail token">
+            </div>
           </div>
         </div>
 
@@ -827,19 +851,29 @@
       currentMailMode = mode;
       localStorage.setItem('mailMode', mode);
       document.getElementById('panelOutlook').style.display = mode === 'outlook' ? 'block' : 'none';
+      document.getElementById('panelFreemail').style.display = mode === 'freemail' ? 'block' : 'none';
       document.getElementById('panelDomain').style.display = mode === 'domain' ? 'block' : 'none';
       document.getElementById('btnLoadFile').style.display = mode === 'outlook' ? '' : 'none';
       // 切换按钮样式
       const btnO = document.getElementById('btnModeOutlook');
+      const btnF = document.getElementById('btnModeFreemail');
       const btnD = document.getElementById('btnModeDomain');
 
       if (mode === 'outlook') {
         btnO.className = 'btn btn-primary';
+        btnF.className = 'btn btn-outline';
+        btnD.className = 'btn btn-outline';
+      }
+
+      else if (mode === 'freemail') {
+        btnO.className = 'btn btn-outline';
+        btnF.className = 'btn btn-primary';
         btnD.className = 'btn btn-outline';
       }
 
       else {
         btnO.className = 'btn btn-outline';
+        btnF.className = 'btn btn-outline';
         btnD.className = 'btn btn-primary';
       }
     }
@@ -877,6 +911,24 @@
       }
 
       catch (e) { }
+
+      try {
+        const freemailCfg = JSON.parse(localStorage.getItem('freemailConfig') || '{}');
+        if (freemailCfg.emails) document.getElementById('freemailEmails').value = freemailCfg.emails;
+        if (freemailCfg.worker_domain) document.getElementById('freemailWorkerDomain').value = freemailCfg.worker_domain;
+        if (freemailCfg.token) document.getElementById('freemailToken').value = freemailCfg.token;
+      }
+
+      catch (e) { }
+    }
+
+    function saveFreemailConfig() {
+      const cfg = {
+        emails: document.getElementById('freemailEmails').value,
+        worker_domain: document.getElementById('freemailWorkerDomain').value,
+        token: document.getElementById('freemailToken').value,
+      };
+      localStorage.setItem('freemailConfig', JSON.stringify(cfg));
     }
 
     // 页面加载时恢复配置
@@ -890,6 +942,7 @@
       const proxy = document.getElementById('proxy').value.trim();
       const workers = parseInt(document.getElementById('workers').value) || 1;
       let domainMailPayload = null;
+      let freemailPayload = null;
 
       if (currentMailMode === 'domain') {
         // 域名邮箱模式：自动生成账号
@@ -937,6 +990,30 @@
         sendImapConfigToGo();
       }
 
+      else if (currentMailMode === 'freemail') {
+        saveFreemailConfig();
+        accountsText = document.getElementById('freemailEmails').value.trim();
+        const workerDomain = document.getElementById('freemailWorkerDomain').value.trim();
+        const freemailToken = document.getElementById('freemailToken').value.trim();
+
+        if (!accountsText) {
+          showToast('❌ 请填写 FreeMail 邮箱地址列表', 'error');
+          appendLog('❌ 请填写 FreeMail 邮箱地址列表', 'error');
+          return;
+        }
+
+        if (!workerDomain || !freemailToken) {
+          showToast('❌ 请填写 worker 网址和 freemail token', 'error');
+          appendLog('❌ 请填写 worker 网址和 freemail token', 'error');
+          return;
+        }
+
+        freemailPayload = {
+          worker_domain: workerDomain,
+          token: freemailToken,
+        };
+      }
+
       else {
         // Outlook 模式：从账号列表
         accountsText = document.getElementById('accounts').value.trim();
@@ -965,12 +1042,14 @@
       try {
         const payload = {
           accounts: accountsText, proxy, workers,
+          mail_mode: currentMailMode,
           login_mode: document.getElementById('loginMode').checked,
           skip_finished: document.getElementById('skipFinished').checked
         }
 
           ;
         if (domainMailPayload) payload.domain_mail = domainMailPayload;
+        if (freemailPayload) payload.freemail = freemailPayload;
 
         const resp = await fetch('/api/start', {
 
@@ -1076,7 +1155,8 @@
       }
 
       // 从输入框和缓存中找到失败账号的原始行
-      const inputLines = document.getElementById('accounts').value.trim().split('\n');
+      const sourceId = currentMailMode === 'freemail' ? 'freemailEmails' : 'accounts';
+      const inputLines = document.getElementById(sourceId).value.trim().split('\n');
       const retryLines = [];
 
       for (const email of failedEmails) {
@@ -1088,7 +1168,10 @@
         }
 
         // 否则从输入框查找
-        const found = inputLines.find(l => l.trim().startsWith(email + '----'));
+        const found = inputLines.find(l => {
+          const t = l.trim();
+          return t === email || t.startsWith(email + '----');
+        });
         if (found) retryLines.push(found.trim());
       }
 
@@ -1098,7 +1181,7 @@
       }
 
       // 填入失败账号并自动开始
-      document.getElementById('accounts').value = retryLines.join('\n');
+      document.getElementById(sourceId).value = retryLines.join('\n');
 
       showToast(`🔁 已填入 ${retryLines.length} 个失败账号，开始重试...`, 'info');
 

@@ -67,7 +67,14 @@ def broadcast_log(text: str, level: str = ""):
 # ═══════════════════════════════════════════════════════
 # 注册线程（复用 api_register 的核心逻辑）
 # ═══════════════════════════════════════════════════════
-def _register_worker(accounts: list[MailAccount], proxy: str, workers: int, mode: str = "register", domain_mail: dict = None):
+def _register_worker(
+    accounts: list[MailAccount],
+    proxy: str,
+    workers: int,
+    mode: str = "register",
+    domain_mail: dict = None,
+    freemail: dict = None,
+):
     """在后台执行批量注册"""
     import random
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -136,7 +143,16 @@ def _register_worker(accounts: list[MailAccount], proxy: str, workers: int, mode
                     time.sleep(0.5)
 
             try:
-                result = register_account(acc, proxy, used_codes, mode=mode, cancel_fn=_check_stop, domain_mail=domain_mail)
+                result = register_account(
+                    acc,
+                    proxy,
+                    used_codes,
+                    mode=mode,
+                    cancel_fn=_check_stop,
+                    domain_mail=domain_mail,
+                    freemail_worker_domain=(freemail or {}).get("worker_domain", ""),
+                    freemail_token=(freemail or {}).get("token", ""),
+                )
 
                 # 注册完成后再检查一次停止
                 if _check_stop():
@@ -315,7 +331,16 @@ class WebHandler(BaseHTTPRequestHandler):
         login_mode = data.get("login_mode", False)
         skip_finished = data.get("skip_finished", True)
         domain_mail = data.get("domain_mail", None)  # 域名邮箱配置
+        mail_mode = data.get("mail_mode", "outlook")
+        freemail = data.get("freemail", None)
         mode = "login" if login_mode else "register"
+
+        if mail_mode == "freemail":
+            worker_domain = (freemail or {}).get("worker_domain", "").strip()
+            token = (freemail or {}).get("token", "").strip()
+            if not worker_domain or not token:
+                self._json_response({"error": "FreeMail 模式需要填写 worker 网址和 freemail token"})
+                return
 
         # 解析账号
         accounts = []
@@ -324,7 +349,13 @@ class WebHandler(BaseHTTPRequestHandler):
             if not line or line.startswith("#"):
                 continue
             try:
-                accounts.append(MailAccount.parse(line))
+                if mail_mode == "freemail":
+                    email = line.split("----")[0].strip().lower()
+                    if not email:
+                        continue
+                    accounts.append(MailAccount(email=email, password="", is_freemail=True))
+                else:
+                    accounts.append(MailAccount.parse(line))
             except ValueError:
                 continue
 
@@ -346,7 +377,7 @@ class WebHandler(BaseHTTPRequestHandler):
         # 启动注册线程
         thread = threading.Thread(
             target=_register_worker,
-            args=(pending, proxy, workers, mode, domain_mail),
+            args=(pending, proxy, workers, mode, domain_mail, freemail),
             daemon=True,
         )
         thread.start()
